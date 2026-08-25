@@ -137,13 +137,17 @@ function parseInput(url) {
   const rawList = get("l");
 
   if (rawList) {
-    const rows = rawList.split(/[;|]/).filter(Boolean).slice(0, 8).map((row, i) => {
+    const rows = rawList.split(/[;|]/).map((s) => s.trim())
+      .filter((row) => row.includes("~")).slice(0, 8).map((row, i) => {
       const [rawTitle, nick, views, ups, cmts] = row.split("~");
-      let title = (rawTitle || "제목 없음").slice(0, 40);
+      let title = (rawTitle || "제목 없음").trim().slice(0, 40);
       let mark = "일반";
       let hot = false;
-      if (title.startsWith("?")) { mark = "질문"; title = title.slice(1); }
-      if (title.startsWith("!")) { hot = true; title = title.slice(1); }
+      while (/^[?!*]/.test(title)) {
+        if (title[0] === "?") mark = "질문";
+        if (title[0] === "!") hot = true;
+        title = title.slice(1);
+      }
       return {
         no: 481029 - i,
         mark,
@@ -160,7 +164,7 @@ function parseInput(url) {
     return { mode: "list", board, rows, notices };
   }
 
-  const title = get("t").slice(0, 52) || "제목 없음";
+  const title = get("t").replace(/^[?!*\s]+/, "").slice(0, 52) || "제목 없음";
   return {
     mode: "post",
     board,
@@ -171,12 +175,17 @@ function parseInput(url) {
     up: num(get("r"), "0"),
     down: num(get("x"), "0"),
     body: get("s").slice(0, 420),
-    comments: get("c").split(/[;|]/).filter(Boolean).slice(0, 5).map((row, i) => {
-      const [nick, ...rest] = row.split("~");
-      let raw = (nick || "ㅇㅇ").slice(0, 15);
-      const reply = raw.startsWith("ㄴ");
-      if (reply) raw = raw.slice(1);
-      return { who: parseNick(raw, title + "c" + i), reply, text: rest.join("~").slice(0, 110) };
+    comments: get("c").split(/[;|]/).map((s) => s.trim()).filter(Boolean).slice(0, 5).map((row, i) => {
+      let r = row;
+      let depth = 0;
+      while (r.startsWith("ㄴ") && depth < 2) { depth += 1; r = r.slice(1).trim(); }
+      r = r.replace(/^ㄴ+/, "").trim();
+      const k = r.indexOf("~");
+      let nick = k === -1 ? "" : r.slice(0, k).trim();
+      let text = k === -1 ? r : r.slice(k + 1).trim();
+      if (!text) { text = nick; nick = ""; }
+      if (nick.length > 15) { text = nick + (text ? " " + text : ""); nick = ""; }
+      return { who: parseNick(nick || "ㅇㅇ", title + "c" + i), depth, text: text.slice(0, 110) };
     }),
   };
 }
@@ -348,7 +357,7 @@ function postSvg({ board, title, who, date, views, up, down, body, comments }) {
 
   const laid = [];
   for (const c of comments) {
-    const indent = c.reply ? 32 : 0;
+    const indent = c.depth * 30;
     const lines = wrapText(c.text, 15.5, 850 - indent, 2);
     const h = 20 + lines.length * 22 + 8;
     if (cy + h > 612) break;
@@ -380,7 +389,7 @@ ${chrome(board)}
   <line x1="36" y1="${cHeadY + 10}" x2="964" y2="${cHeadY + 10}" stroke="#eef0f4"/>
 
   ${laid.map((c) => `
-  ${c.reply ? `<text x="40" y="${c.y + 19}" class="meta" fill="#b3bac1">ㄴ</text>` : ""}
+  ${c.depth ? `<text x="${10 + c.indent}" y="${c.y + 19}" class="meta" fill="#b3bac1">ㄴ</text>` : ""}
   ${nickInline(c.who, 36 + c.indent, c.y + 19, 14).el}
   ${c.lines.map((ln, i) => `<text x="${36 + c.indent}" y="${c.y + 37 + i * 22}" class="cmt">${esc(ln)}</text>`).join("")}
   <line x1="${36 + c.indent}" y1="${c.y + 20 + c.lines.length * 22 + 7}" x2="964" y2="${c.y + 20 + c.lines.length * 22 + 7}" stroke="#f4f5f8"/>`).join("")}
