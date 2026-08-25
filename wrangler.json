@@ -1,0 +1,12 @@
+{
+  "name": "bi",
+  "main": "inside.js",
+  "compatibility_date": "2026-08-25",
+  "workers_dev": true,
+  "preview_urls": false,
+  "logpush": false,
+  "observability": {
+    "enabled": false,
+    "logs": { "invocation_logs": false }
+  }
+}
