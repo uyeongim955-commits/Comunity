@@ -23,8 +23,9 @@
  * 주의: 본문·댓글 텍스트가 URL에 실려 Cloudflare 네트워크를 경유함.
  * 배포 후 Worker Settings > Observability에서 Workers Logs를 반드시 비활성화할 것.
  *
- * 방어
- * - 허용 파라미터 외 키·중복 키·3000자 초과 쿼리는 400.
+ * 방어 · 프챗급 방탄
+ * - 어떤 GET에도 400을 내지 않음: 미지 키·중복 키 무시, 전각 기호·&amp; 자동 교정,
+ *   초과 길이 절단. 목록 줄에 닉·조회·추천이 빠지면 결정적 해시로 그럴듯하게 채움.
  * - 모든 텍스트의 XML 특수문자는 이스케이프.
  * - 외부 통신·저장소·분석 코드 없음. IP·헤더·쿠키 미참조.
  */
@@ -93,9 +94,11 @@ function wrapText(text, size, maxWidth, maxLines) {
   return lines.slice(0, maxLines);
 }
 
-function num(raw, fallback) {
-  const n = Number(raw);
-  return Number.isInteger(n) && n >= 0 && n <= 9999999 ? n.toLocaleString("en-US") : fallback;
+// 숫자면 그대로, 누락·오기면 시드 기반 결정값으로 채움 — 같은 글은 언제나 같은 수치
+function num(raw, seed, lo, hi) {
+  const d = String(raw ?? "").replace(/[^\d]/g, "").slice(0, 7);
+  if (d) return Number(d).toLocaleString("en-US");
+  return (lo + (fnv(seed) % (hi - lo + 1))).toLocaleString("en-US");
 }
 
 function shiftTime(base, minutes) {
@@ -105,13 +108,18 @@ function shiftTime(base, minutes) {
   return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
 }
 
-// 결정적 가짜 IP 앞 두 옥텟 (유동닉 표시용, 실제 IP 아님)
-function fakeIp(seed) {
+function fnv(seed) {
   let h = 2166136261;
   for (const ch of seed) {
     h ^= ch.codePointAt(0);
     h = Math.imul(h, 16777619) >>> 0;
   }
+  return h;
+}
+
+// 결정적 가짜 IP 앞 두 옥텟 (유동닉 표시용, 실제 IP 아님)
+function fakeIp(seed) {
+  const h = fnv(seed);
   return `${100 + (h % 124)}.${(h >>> 9) % 256}`;
 }
 
@@ -122,23 +130,43 @@ function parseNick(raw, seed) {
   return { nick, fixed, ip: fixed ? "" : fakeIp(nick + "|" + seed) };
 }
 
-function parseInput(url) {
-  if (url.search.length > 3000) return null;
-  const allowed = new Set(["g", "t", "w", "d", "v", "r", "x", "s", "c", "l", "o"]);
-  const seen = new Set();
-  for (const [key] of url.searchParams) {
-    if (!allowed.has(key) || seen.has(key)) return null;
-    seen.add(key);
+// 전각 기호를 반각으로 (프챗급 모델이 섞어 쓰는 ；～：！＊ 등)
+const FW_MAP = { "；": ";", "｜": "|", "～": "~", "：": ":", "！": "!", "？": "?", "＊": "*", "＋": " ", "　": " ", "＆": "&", "＝": "=" };
+function fwNorm(s) {
+  return s.replace(/[；｜～：！？＊＋　＆＝０-９]/g, (c) => FW_MAP[c] ?? String.fromCharCode(c.charCodeAt(0) - 0xfee0));
+}
+
+// 프챗급 방탄 — 절대 400을 내지 않는다.
+// 경로 무관 · 미지 키 무시 · 중복 키는 첫 유효값 · 구조 깨진 전각 ＆＝·&amp;는 교정 · 초과 길이는 절단.
+function lenientParams(search, cap) {
+  let raw = search.startsWith("?") ? search.slice(1) : search;
+  if (raw.length > cap) raw = raw.slice(0, cap);
+  raw = raw
+    .replace(/&(amp;)+/gi, "&")
+    .replace(/%EF%BC%86/gi, "&").replace(/[＆]/g, "&")
+    .replace(/%EF%BC%9D/gi, "=").replace(/[＝]/g, "=");
+  let sp;
+  try { sp = new URLSearchParams(raw); } catch (e) { sp = new URLSearchParams(); }
+  const first = new Map();
+  for (const [rk, rv] of sp) {
+    const key = rk.trim().toLowerCase();
+    if (!first.has(key) || first.get(key) === "") first.set(key, String(rv));
   }
-  const get = (key) => (url.searchParams.get(key) ?? "").replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  return first;
+}
+
+function parseInput(url) {
+  const first = lenientParams(url.search, 6000);
+  const get = (key) => fwNorm(first.get(key) ?? "").replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  const hasList = first.has("l");
 
   const board = get("g").slice(0, 14) || "용살자";
   const date = get("d").slice(0, 24);
   const rawList = get("l");
 
-  if (rawList) {
+  if (hasList || rawList) {
     const rows = rawList.split(/[;|]/).map((s) => s.trim())
-      .filter((row) => row.includes("~")).slice(0, 8).map((row, i) => {
+      .filter(Boolean).slice(0, 8).map((row, i) => {
       const [rawTitle, nick, views, ups, cmts] = row.split("~");
       let title = (rawTitle || "제목 없음").trim().slice(0, 40);
       let mark = "일반";
@@ -148,16 +176,19 @@ function parseInput(url) {
         if (title[0] === "!") hot = true;
         title = title.slice(1);
       }
+      title = title.trim() || "제목 없음";
+      const nRaw = (cmts || "").trim();
+      const nAuto = fnv(title + "n") % 9;
       return {
         no: 481029 - i,
         mark,
         hot,
-        title: title || "제목 없음",
-        cmts: /^\d{1,4}$/.test(cmts || "") ? cmts : "",
+        title,
+        cmts: /^\d{1,4}$/.test(nRaw) ? nRaw : (nAuto ? String(nAuto) : ""),
         who: parseNick(nick, title + i),
         time: shiftTime(date || "18:15", i),
-        views: num(views, "0"),
-        ups: num(ups, "0"),
+        views: num(views, title + "v", 214, 4890),
+        ups: num(ups, title + "u", 2, 47),
       };
     });
     const notices = get("o").split(/[;|]/).filter(Boolean).slice(0, 2).map((n) => n.slice(0, 34));
@@ -171,11 +202,11 @@ function parseInput(url) {
     title,
     who: parseNick(get("w"), title),
     date: date || "18:15",
-    views: num(get("v"), "0"),
-    up: num(get("r"), "0"),
-    down: num(get("x"), "0"),
+    views: num(get("v"), title + "v", 512, 9740),
+    up: num(get("r"), title + "u", 5, 128),
+    down: num(get("x"), title + "d", 0, 31),
     body: get("s").slice(0, 420),
-    comments: get("c").split(/[;|]/).map((s) => s.trim()).filter(Boolean).slice(0, 5).map((row, i) => {
+    comments: get("c").split(/[;|]/).map((s) => s.trim()).filter(Boolean).slice(0, 6).map((row, i) => {
       let r = row;
       let depth = 0;
       while (r.startsWith("ㄴ") && depth < 2) { depth += 1; r = r.slice(1).trim(); }
@@ -330,7 +361,7 @@ function listSvg({ board, rows, notices }) {
     return el;
   }).join("");
 
-  return `<?xml version="1.0" encoding="UTF-8"?>
+  return `<?xml version="1.0" encoding="UTF-8"?><!--R3-->
 <svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="부산인사이드 ${esc(board)} 갤러리 글목록">
 ${STYLE}
 ${chrome(board)}
@@ -351,23 +382,22 @@ function postSvg({ board, title, who, date, views, up, down, body, comments }) {
   const metaY = titleTop + titleLines.length * 30 + 6;
   const bodyTop = metaY + 30;
   const bodyBottom = bodyTop + bodyLines.length * 30 + 6;
-  const voteY = bodyBottom + 16;
-  const cHeadY = voteY + 52;
-  let cy = cHeadY + 18;
+  const voteY = bodyBottom + 10;
+  const cHeadY = voteY + 50;
+  let cy = cHeadY + 16;
 
+  // 댓글은 디시처럼 닉·내용 한 줄 — 본문이 길어도 6개까지 안 잘리게
   const laid = [];
   for (const c of comments) {
-    const indent = c.depth * 30;
-    const lines = wrapText(c.text, 15.5, 850 - indent, 2);
-    const h = 20 + lines.length * 22 + 8;
-    if (cy + h > 612) break;
-    laid.push({ ...c, y: cy, lines, indent });
-    cy += h;
+    const indent = c.depth * 26;
+    if (cy + 28 > 618) break;
+    laid.push({ ...c, y: cy, indent });
+    cy += 28;
   }
 
   const wn = nickInline(who, 36, metaY + 18, 13.5);
 
-  return `<?xml version="1.0" encoding="UTF-8"?>
+  return `<?xml version="1.0" encoding="UTF-8"?><!--R3-->
 <svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="부산인사이드 ${esc(board)} ${esc(title)}">
 ${STYLE}
 ${chrome(board)}
@@ -388,11 +418,15 @@ ${chrome(board)}
   <text x="50" y="${cHeadY}" class="cnt">댓글 ${comments.length}</text>
   <line x1="36" y1="${cHeadY + 10}" x2="964" y2="${cHeadY + 10}" stroke="#eef0f4"/>
 
-  ${laid.map((c) => `
-  ${c.depth ? `<text x="${10 + c.indent}" y="${c.y + 19}" class="meta" fill="#b3bac1">ㄴ</text>` : ""}
-  ${nickInline(c.who, 36 + c.indent, c.y + 19, 14).el}
-  ${c.lines.map((ln, i) => `<text x="${36 + c.indent}" y="${c.y + 37 + i * 22}" class="cmt">${esc(ln)}</text>`).join("")}
-  <line x1="${36 + c.indent}" y1="${c.y + 20 + c.lines.length * 22 + 7}" x2="964" y2="${c.y + 20 + c.lines.length * 22 + 7}" stroke="#f4f5f8"/>`).join("")}
+  ${laid.map((c) => {
+    const ni = nickInline(c.who, 36 + c.indent, c.y + 19, 14);
+    const tx = Math.round(ni.next) + 12;
+    return `
+  ${c.depth ? `<text x="${12 + c.indent}" y="${c.y + 19}" class="meta" fill="#b3bac1">ㄴ</text>` : ""}
+  ${ni.el}
+  <text x="${tx}" y="${c.y + 19}" class="cmt">${esc(clip(c.text, 15.5, 950 - tx))}</text>
+  <line x1="${36 + c.indent}" y1="${c.y + 27}" x2="964" y2="${c.y + 27}" stroke="#f4f5f8"/>`;
+  }).join("")}
 
   <text x="36" y="628" class="foot">부산인사이드 · 방어선 안쪽 유일 커뮤니티 · 게시물의 사실 여부는 검증되지 않음</text>
 </svg>`;
@@ -421,13 +455,7 @@ export default {
     }
 
     const url = new URL(request.url);
-    const data = url.pathname === "/" ? parseInput(url) : null;
-    if (!data) {
-      return new Response(request.method === "HEAD" ? null : "Invalid parameters.", {
-        status: 400,
-        headers: responseHeaders("text/plain; charset=utf-8"),
-      });
-    }
+    const data = parseInput(url);
 
     const svg = data.mode === "list" ? listSvg(data) : postSvg(data);
     return new Response(request.method === "HEAD" ? null : svg, {
