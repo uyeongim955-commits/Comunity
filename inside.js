@@ -123,6 +123,22 @@ function fakeIp(seed) {
   return `${100 + (h % 124)}.${(h >>> 9) % 256}`;
 }
 
+// 이 조각이 닉처럼 보이는가. 디시 닉은 짧고 문장부호가 없다.
+function looksLikeNick(s) {
+  const t = String(s || "").trim().replace(/^\*/, "");
+  if (!t || t.length > 12) return false;
+  if (/[.?!,~]/.test(t)) return false;                 // 문장부호 → 내용
+  if ((t.match(/ /g) || []).length > 1) return false;  // 공백 2개 이상 → 문장
+  if (/^[ㅋㅎㅠㅜ]{3,}/.test(t)) return false;          // ㅋㅋㅋ… → 내용
+  return true;
+}
+
+// a~b 가 "내용~닉" 으로 뒤집혀 있으면 바로잡는다
+function orient(a, b) {
+  if (a && b && !looksLikeNick(a) && looksLikeNick(b)) return [b, a];
+  return [a, b];
+}
+
 function parseNick(raw, seed) {
   let nick = (raw || "ㅇㅇ").slice(0, 15);
   const fixed = nick.startsWith("*");
@@ -167,7 +183,11 @@ function parseInput(url) {
   if (hasList || rawList) {
     const rows = rawList.split(/[;|]/).map((s) => s.trim())
       .filter(Boolean).slice(0, 8).map((row, i) => {
-      const [rawTitle, nick, views, ups, cmts] = row.split("~");
+      let [rawTitle, nick, views, ups, cmts] = row.split("~");
+      // 말머리(?!*)가 붙어 있으면 그쪽이 제목 확정 — 없을 때만 순서를 의심한다
+      if (!/^[?!*]/.test(String(rawTitle || "").trim())) {
+        [rawTitle, nick] = orient(rawTitle, nick);
+      }
       let title = (rawTitle || "제목 없음").trim().slice(0, 40);
       let mark = "일반";
       let hot = false;
@@ -215,8 +235,12 @@ function parseInput(url) {
       let nick = k === -1 ? "" : r.slice(0, k).trim();
       let text = k === -1 ? r : r.slice(k + 1).trim();
       if (!text) { text = nick; nick = ""; }
+      [nick, text] = orient(nick, text);
       if (nick.length > 15) { text = nick + (text ? " " + text : ""); nick = ""; }
-      return { who: parseNick(nick || "ㅇㅇ", title + "c" + i), depth, text: text.slice(0, 110) };
+      const who = nick || "ㅇㅇ";
+      // 같은 별명은 같은 IP, 기본닉 ㅇㅇ 는 사람마다 다른 IP
+      const seed = who === "ㅇㅇ" ? title + "c" + i : title;
+      return { who: parseNick(who, seed), depth, text: text.slice(0, 110) };
     }),
   };
 }
